@@ -29,7 +29,7 @@ class PadToMultiple:
     Pads an image to ensure its dimensions are a multiple of a given number.
     This is useful for convolutional layers that might require specific input dimensions.
     """
-    def __init__(self, multiple=1):
+    def __init__(self, multiple=16):
         self.multiple = multiple
 
     def __call__(self, img):
@@ -82,13 +82,14 @@ class ImageFolderDataset(Dataset):
 class LatentRefiner(nn.Module):
     """
     A small convolutional network to refine the latent space representation.
+    Increased 'channels' to match the deeper latent space.
     """
-    def __init__(self, channels=4):
+    def __init__(self, channels): # channels will now be dynamic based on encoder output
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(channels, channels, 1), # 1x1 convolution
+            nn.Conv2d(channels, channels, 1), # 1x1 convolution (more matrices)
             nn.ReLU(),
-            nn.Conv2d(channels, channels, 1) # Another 1x1 convolution
+            nn.Conv2d(channels, channels, 1) # Another 1x1 convolution (more matrices)
         )
     def forward(self, z):
         return self.net(z)
@@ -99,21 +100,35 @@ class ColorCompressor(nn.Module):
     It consists of an encoder, a latent refiner, and a decoder.
     The model aims to reduce image file size by learning a compact latent representation
     while preserving image color and quality through reconstruction.
+    The architecture has been expanded to use more matrices and reduce pixelation.
     """
     def __init__(self):
         super().__init__()
-        # Encoder: Reduces spatial dimensions and increases channel depth
+        # Encoder: Reduces spatial dimensions and increases channel depth significantly
+        # More layers and more channels mean more matrix multiplications.
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, 16, 3, 2, 1), nn.ReLU(), # Output: (N, 16, H/2, W/2)
-            nn.Conv2d(16, 8, 3, 2, 1), nn.ReLU(), # Output: (N, 8, H/4, W/4)
-            nn.Conv2d(8, 4, 3, 2, 1), nn.ReLU()   # Output: (N, 4, H/8, W/8)
+            nn.Conv2d(3, 64, 3, 2, 1), nn.ReLU(),   # Output: (N, 64, H/2, W/2)
+            nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(), # Output: (N, 128, H/4, W/4)
+            nn.Conv2d(128, 256, 3, 2, 1), nn.ReLU(), # Output: (N, 256, H/8, W/8)
+            nn.Conv2d(256, 512, 3, 2, 1), nn.ReLU()  # Output: (N, 512, H/16, W/16)
         )
-        self.refiner = LatentRefiner(4) # Refines the latent representation
+        # Latent Refiner: Updated to handle the new deeper latent space (512 channels)
+        self.refiner = LatentRefiner(512) 
+        
         # Decoder: Increases spatial dimensions and reduces channel depth
+        # Using Upsample + Conv2d to reduce pixelation/checkerboard artifacts and improve smoothness.
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(4, 8, 3, 2, 1, 1), nn.ReLU(),  # Output: (N, 8, H/4, W/4)
-            nn.ConvTranspose2d(8, 16, 3, 2, 1, 1), nn.ReLU(), # Output: (N, 16, H/2, W/2)
-            nn.ConvTranspose2d(16, 3, 3, 2, 1, 1), nn.Sigmoid() # Output: (N, 3, H, W), values between 0 and 1
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(512, 256, 3, 1, 1), nn.ReLU(), # Output: (N, 256, H/8, W/8)
+            
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(256, 128, 3, 1, 1), nn.ReLU(), # Output: (N, 128, H/4, W/4)
+            
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(128, 64, 3, 1, 1), nn.ReLU(),  # Output: (N, 64, H/2, W/2)
+            
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(64, 3, 3, 1, 1), nn.Sigmoid() # Output: (N, 3, H, W), values between 0 and 1
         )
     def forward(self, x):
         z = self.encoder(x) # Encode the input image to a latent representation
@@ -139,7 +154,7 @@ loader = DataLoader(dataset, batch_size=1, shuffle=True)
 alpha, beta = 1e-3, 1e-4
 
 # Training loop
-for epoch in range(1, 100): # Iterate for a fixed number of epochs
+for epoch in range(1, 200): # Iterate for a fixed number of epochs
     model.train() # Set the model to training mode
     total = 0.0 # Initialize total loss for the epoch
     for i, (img, names) in enumerate(loader): # Iterate over batches
@@ -164,7 +179,7 @@ for epoch in range(1, 100): # Iterate for a fixed number of epochs
             # Convert tensor to numpy array, transpose dimensions, scale to 0-255, and convert to uint8
             npimg = (recon[j].cpu().detach().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
             # Save the reconstructed image. The file size of this image will be a result of the compression.
-            Image.fromarray(npimg).save(os.path.join(output_dir, f'epoch{epoch}_batch{i}_{names[j]}.jpg'))
+            Image.fromarray(npimg).save(os.path.join(output_dir, f'epoch{epoch}_batch{i}_{names[j]}.png'))
 
     # Print average loss for the epoch
     print(f'Epoch {epoch} Loss: {total / len(loader):.4f}')
